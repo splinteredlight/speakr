@@ -2249,6 +2249,11 @@ else:
     ASR_MIN_SPEAKERS = None
     ASR_MAX_SPEAKERS = None
 
+# NEW: choose diarizer backend via env (nemo|pyannote), default nemo
+ASR_DIARIZER = os.environ.get('ASR_DIARIZER', 'nemo').lower()
+if ASR_DIARIZER not in ('nemo', 'pyannote'):
+    ASR_DIARIZER = 'nemo'
+
 # Audio chunking configuration for large files with OpenAI Whisper API
 ENABLE_CHUNKING = os.environ.get('ENABLE_CHUNKING', 'true').lower() == 'true'
 CHUNK_SIZE_MB = int(os.environ.get('CHUNK_SIZE_MB', '20'))  # 20MB default for safety margin
@@ -3012,6 +3017,7 @@ def transcribe_audio_asr(app_context, recording_id, filepath, original_filename,
                             params['language'] = language
                         if diarize:
                             params['diarize'] = diarize
+                            params['diarizer'] = ASR_DIARIZER  # <--- NEW
                         if min_speakers:
                             params['min_speakers'] = min_speakers
                         if max_speakers:
