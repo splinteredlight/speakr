@@ -543,8 +543,8 @@ export function useModals(state, utils) {
         date.setSeconds(0);
         date.setMilliseconds(0);
 
-        // Format as ISO string for storage (YYYY-MM-DDTHH:mm:ss)
-        const isoString = date.toISOString().slice(0, 19);
+        // Format as ISO string for storage (keep Z suffix so frontend knows it's UTC)
+        const isoString = date.toISOString();
 
         // Call the callback with the result
         if (dateTimePickerCallback.value) {

@@ -1784,7 +1784,8 @@ def save_metadata():
                     if date_str:
                         # Try to parse as full ISO datetime first
                         try:
-                            recording.meeting_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                            parsed = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                            recording.meeting_date = parsed.replace(tzinfo=None)
                         except (ValueError, AttributeError):
                             # Fall back to date-only format, preserve existing time if available
                             parsed_date = datetime.strptime(date_str, '%Y-%m-%d')

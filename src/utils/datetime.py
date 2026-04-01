@@ -8,7 +8,6 @@ with timezone awareness.
 import os
 import logging
 import pytz
-from babel.dates import format_datetime
 
 # Module-level logger
 logger = logging.getLogger(__name__)
@@ -16,13 +15,16 @@ logger = logging.getLogger(__name__)
 
 def local_datetime_filter(dt):
     """
-    Format a UTC datetime object to the user's local timezone.
+    Convert a UTC datetime object to the user's local timezone and return as ISO 8601.
+
+    Returns an ISO 8601 string with timezone offset (e.g. "2026-03-31T01:31:00-04:00")
+    so the frontend can parse it unambiguously with new Date().
 
     Args:
         dt: datetime object to format (assumed UTC if naive)
 
     Returns:
-        str: Formatted datetime string in user's timezone
+        str: ISO 8601 datetime string with timezone offset
     """
     if dt is None:
         return ""
@@ -42,5 +44,5 @@ def local_datetime_filter(dt):
     # Convert to the user's timezone
     local_dt = dt.astimezone(user_tz)
 
-    # Format it nicely
-    return format_datetime(local_dt, format='medium', locale='en_US')
+    # Return ISO 8601 with timezone offset for unambiguous frontend parsing
+    return local_dt.isoformat()
