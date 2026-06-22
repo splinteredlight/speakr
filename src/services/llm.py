@@ -1,5 +1,5 @@
 """
-LLM API integration services (OpenAI/OpenRouter).
+LLM API integration services (OpenAI/OpenRouter/Anthropic).
 """
 
 import os
@@ -9,6 +9,12 @@ import time
 import logging
 import httpx
 from openai import OpenAI, APITimeoutError
+
+try:
+    from anthropic import Anthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
 
 # Use standard logging instead of current_app.logger for context independence
 logger = logging.getLogger(__name__)
@@ -180,6 +186,136 @@ except Exception as chat_client_init_e:
     chat_client = client
 
 
+def is_anthropic_provider(base_url=None):
+    """Check if the provider is Anthropic based on the base URL."""
+    url = (base_url or TEXT_MODEL_BASE_URL or '').lower()
+    return 'anthropic.com' in url
+
+
+def _anthropic_base_url(url):
+    """Normalize a base URL for the Anthropic SDK (strip trailing /v1 if present)."""
+    url = (url or '').rstrip('/')
+    if url.endswith('/v1'):
+        url = url[:-3]
+    return url or None
+
+
+# Create Anthropic client for TEXT_MODEL if needed
+anthropic_client = None
+if HAS_ANTHROPIC and is_anthropic_provider():
+    try:
+        anthropic_client = Anthropic(
+            api_key=TEXT_MODEL_API_KEY or "not-needed",
+            base_url=_anthropic_base_url(TEXT_MODEL_BASE_URL),
+            timeout=llm_timeout,
+            max_retries=LLM_MAX_RETRIES,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to initialize Anthropic client: {e}")
+
+# Create Anthropic chat client if CHAT_MODEL points to Anthropic
+anthropic_chat_client = None
+_chat_base_url = get_chat_config()['base_url'] or TEXT_MODEL_BASE_URL
+if HAS_ANTHROPIC and is_anthropic_provider(_chat_base_url):
+    try:
+        _chat_cfg = get_chat_config()
+        if _chat_cfg['api_key'] == TEXT_MODEL_API_KEY and anthropic_client:
+            anthropic_chat_client = anthropic_client
+        else:
+            anthropic_chat_client = Anthropic(
+                api_key=_chat_cfg['api_key'] or "not-needed",
+                base_url=_anthropic_base_url(_chat_base_url),
+                timeout=llm_timeout,
+                max_retries=LLM_MAX_RETRIES,
+            )
+    except Exception as e:
+        logger.warning(f"Failed to initialize Anthropic chat client: {e}")
+
+
+class _AttrDict:
+    """Simple object that allows attribute access for OpenAI-compatible response wrapping."""
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+def _make_anthropic_request(anthropic_cl, messages, model_name,
+                             temperature=0.7, max_tokens=None, stream=False,
+                             response_format=None):
+    """
+    Make a request using the Anthropic SDK.
+    Returns OpenAI-compatible response objects so callers don't need changes.
+    """
+    # Extract system messages (Anthropic takes system as a separate parameter)
+    system_parts = []
+    user_messages = []
+    for msg in messages:
+        if msg['role'] == 'system':
+            system_parts.append(msg['content'])
+        else:
+            user_messages.append({'role': msg['role'], 'content': msg['content']})
+
+    system_text = '\n\n'.join(system_parts) if system_parts else None
+
+    # Anthropic has no response_format param — add JSON instruction to system prompt
+    if response_format and response_format.get('type') == 'json_object':
+        json_instruction = '\n\nIMPORTANT: You must respond ONLY with valid JSON. No other text.'
+        system_text = (system_text + json_instruction) if system_text else json_instruction
+
+    kwargs = {
+        'model': model_name,
+        'messages': user_messages,
+        'max_tokens': max_tokens or 4096,
+    }
+    if system_text:
+        kwargs['system'] = system_text
+    if temperature is not None:
+        kwargs['temperature'] = temperature
+
+    if stream:
+        return _anthropic_stream_generator(anthropic_cl, kwargs)
+
+    # Non-streaming request (retries and timeout handled by the SDK client)
+    response = anthropic_cl.messages.create(**kwargs)
+
+    # Map response to OpenAI-compatible shape
+    text = ''.join(block.text for block in response.content if block.type == 'text')
+
+    finish_map = {'end_turn': 'stop', 'max_tokens': 'length', 'stop_sequence': 'stop'}
+    finish_reason = finish_map.get(response.stop_reason, response.stop_reason)
+
+    usage = _AttrDict(
+        prompt_tokens=response.usage.input_tokens,
+        completion_tokens=response.usage.output_tokens,
+        total_tokens=response.usage.input_tokens + response.usage.output_tokens,
+        cost=None
+    )
+    message = _AttrDict(content=text, refusal=None, tool_calls=None)
+    choice = _AttrDict(message=message, finish_reason=finish_reason, index=0)
+
+    return _AttrDict(choices=[choice], usage=usage, id=response.id, model=response.model)
+
+
+def _anthropic_stream_generator(anthropic_cl, kwargs):
+    """Stream from Anthropic SDK, yielding OpenAI-compatible chunk objects."""
+    with anthropic_cl.messages.stream(**kwargs) as stream:
+        for text in stream.text_stream:
+            chunk_delta = _AttrDict(content=text)
+            chunk_choice = _AttrDict(delta=chunk_delta, index=0)
+            yield _AttrDict(choices=[chunk_choice], usage=None)
+
+        # Get final message for usage stats
+        final = stream.get_final_message()
+        if final.usage:
+            final_usage = _AttrDict(
+                prompt_tokens=final.usage.input_tokens,
+                completion_tokens=final.usage.output_tokens,
+                total_tokens=final.usage.input_tokens + final.usage.output_tokens,
+                cost=None
+            )
+            yield _AttrDict(choices=[], usage=final_usage)
+
+
 def is_gpt5_model(model_name):
     """
     Check if the model is a GPT-5 series model that requires special API parameters.
@@ -225,7 +361,7 @@ def call_llm_completion(messages, temperature=0.7, response_format=None, stream=
     Returns:
         OpenAI completion object or generator (if streaming)
     """
-    if not client:
+    if not client and not is_anthropic_provider():
         raise ValueError("LLM client not initialized")
 
     if not TEXT_MODEL_API_KEY:
@@ -298,7 +434,14 @@ def call_llm_completion(messages, temperature=0.7, response_format=None, stream=
         )
 
         request_started_at = time.monotonic()
-        response = client.chat.completions.create(**completion_args)
+        if is_anthropic_provider():
+            response = _make_anthropic_request(
+                anthropic_client, messages, TEXT_MODEL_NAME,
+                temperature=completion_args.get('temperature'),
+                max_tokens=max_tokens, stream=stream, response_format=response_format
+            )
+        else:
+            response = client.chat.completions.create(**completion_args)
 
         # Track usage for non-streaming calls
         if user_id and operation_type and not stream and response.usage:
@@ -370,8 +513,9 @@ def call_chat_completion(messages, temperature=0.7, response_format=None, stream
     """
     effective_client = chat_client if chat_client else client
     chat_config = get_chat_config()
+    chat_base_url = chat_config['base_url'] or TEXT_MODEL_BASE_URL
 
-    if not effective_client:
+    if not effective_client and not is_anthropic_provider(chat_base_url):
         raise ValueError("Chat LLM client not initialized")
 
     if not chat_config['api_key']:
@@ -435,7 +579,14 @@ def call_chat_completion(messages, temperature=0.7, response_format=None, stream
         )
 
         request_started_at = time.monotonic()
-        response = effective_client.chat.completions.create(**completion_args)
+        if is_anthropic_provider(chat_base_url):
+            response = _make_anthropic_request(
+                anthropic_chat_client, messages, model_name,
+                temperature=completion_args.get('temperature'),
+                max_tokens=max_tokens, stream=stream, response_format=response_format
+            )
+        else:
+            response = effective_client.chat.completions.create(**completion_args)
 
         # Track usage for non-streaming calls
         if user_id and operation_type and not stream and response.usage:
