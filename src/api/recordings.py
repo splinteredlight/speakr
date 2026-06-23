@@ -3846,6 +3846,25 @@ def add_tag_to_recording(recording_id):
         )
         db.session.add(recording_tag)
 
+        # Auto-add this tag's default participants to the recording.
+        # Append + dedupe (case-insensitive), order-preserving; never removes existing names.
+        if tag.default_participants:
+            existing = [p.strip() for p in (recording.participants or '').split(',') if p.strip()]
+            seen = {p.lower() for p in existing}
+            for name in (n.strip() for n in tag.default_participants.split(',')):
+                if not name or name.lower() in seen:
+                    continue
+                # Respect the Recording.participants String(500) column cap
+                if len(', '.join(existing + [name])) > 500:
+                    current_app.logger.warning(
+                        f"Recording {recording_id}: skipping default participant '{name}' from "
+                        f"tag '{tag.name}' (would exceed the 500-char participants limit)"
+                    )
+                    break
+                existing.append(name)
+                seen.add(name.lower())
+            recording.participants = ', '.join(existing)
+
         # If this is a group tag with sharing enabled, automatically share the recording
         # Only auto-share if recording is completed (not during processing)
         if tag.group_id and ENABLE_INTERNAL_SHARING and recording.status == 'COMPLETED' and (tag.auto_share_on_apply or tag.share_with_group_lead):
