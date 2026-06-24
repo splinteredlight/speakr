@@ -99,8 +99,8 @@ class Speaker(db.Model):
         return {
             'id': self.id,
             'name': self.name,
-            'created_at': self.created_at,
-            'last_used': self.last_used,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'last_used': self.last_used.isoformat() if self.last_used else None,
             'use_count': self.use_count,
             'embedding_count': self.embedding_count,
             'confidence_score': self.confidence_score

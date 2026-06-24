@@ -11,7 +11,7 @@ import mimetypes
 import time
 import threading
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from src.services.job_queue import job_queue
 from flask import Blueprint, render_template, request, redirect, url_for, flash, jsonify, send_file, Response, current_app, make_response
 from flask_login import login_required, current_user
@@ -1996,7 +1996,11 @@ def save_metadata():
                     if date_str:
                         # Try to parse as full ISO datetime first
                         try:
-                            recording.meeting_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                            parsed_dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                            # Normalize tz-aware input to naive UTC (storage convention)
+                            if parsed_dt.tzinfo is not None:
+                                parsed_dt = parsed_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                            recording.meeting_date = parsed_dt
                         except (ValueError, AttributeError):
                             # Fall back to date-only format, preserve existing time if available
                             parsed_date = datetime.strptime(date_str, '%Y-%m-%d')
@@ -2639,7 +2643,9 @@ def upload_file():
         if user_meeting_date:
             try:
                 parsed = datetime.fromisoformat(user_meeting_date.replace('Z', '+00:00'))
-                # Strip timezone to store as naive datetime, consistent with other date sources
+                # Normalize tz-aware input to naive UTC (Speakr's storage convention) before stripping
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone(timezone.utc)
                 meeting_date = parsed.replace(tzinfo=None)
                 current_app.logger.info(f"Using user-provided meeting_date: {meeting_date}")
             except (ValueError, TypeError) as e:
@@ -2650,7 +2656,7 @@ def upload_file():
             try:
                 # JavaScript lastModified is in milliseconds since epoch
                 timestamp_ms = int(file_last_modified)
-                meeting_date = datetime.fromtimestamp(timestamp_ms / 1000)
+                meeting_date = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).replace(tzinfo=None)
                 current_app.logger.info(f"Using client file lastModified: {meeting_date}")
             except (ValueError, TypeError, OSError) as e:
                 current_app.logger.warning(f"Could not parse file_last_modified '{file_last_modified}': {e}")
