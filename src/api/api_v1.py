@@ -2823,8 +2823,11 @@ def upload_recording():
       - file (required)
       - notes (optional)
       - title (optional)
-      - meeting_date (optional, ISO 8601)
-      - file_last_modified (optional, ms epoch)
+      - meeting_date (optional, ISO 8601; stored exactly as given)
+      - file_last_modified (optional, ms epoch; treated as the END of the
+        recording — meeting_date is estimated as this minus the media
+        duration, rounded to the nearest 15 minutes. Send meeting_date
+        instead to store an exact start time.)
       - language (optional)
       - min_speakers (optional)
       - max_speakers (optional)
