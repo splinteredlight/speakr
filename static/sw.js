@@ -1,4 +1,4 @@
-const CACHE_NAME = 'Speakr-cache-v6';
+const CACHE_NAME = 'Speakr-cache-v7';
 const ASSETS_TO_CACHE = [
   '/',
   '/static/offline.html',

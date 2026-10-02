@@ -680,9 +680,21 @@ export function useAudio(state, utils) {
                 systemAnalyser.value.fftSize = 256;
 
                 micSource.connect(micAnalyser.value);
-                micSource.connect(destination);
                 systemSource.connect(systemAnalyser.value);
-                systemSource.connect(destination);
+
+                // Dual-channel capture: microphone on the LEFT channel (0),
+                // system/tab audio on the RIGHT channel (1), instead of summing
+                // both into mono. Our WhisperX service diarizes the remote
+                // channel alone and attributes the mic channel to the local
+                // speaker, so the person recording is never clustered with the
+                // remote voices. Each merger input is downmixed to mono by the
+                // Web Audio spec, so a stereo system track still lands on one
+                // channel. Side effect: playback is hard-panned (mic left,
+                // remote right).
+                const channelMerger = audioContext.value.createChannelMerger(2);
+                micSource.connect(channelMerger, 0, 0);
+                systemSource.connect(channelMerger, 0, 1);
+                channelMerger.connect(destination);
 
                 combinedStream = destination.stream;
                 activeStreams.value = [micStream, displayStream];

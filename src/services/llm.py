@@ -200,6 +200,19 @@ def _anthropic_base_url(url):
     return url or None
 
 
+# anthropic SDK 1.x is built on httpx2, and a Timeout from the old ``httpx``
+# package makes every request die with "'Timeout' object cannot be interpreted
+# as an integer" (surfaced as APIConnectionError). Build the SDK's own Timeout
+# type with the same values for the Anthropic clients.
+try:
+    from anthropic import Timeout as _AnthropicTimeout
+    anthropic_timeout = _AnthropicTimeout(
+        connect=llm_timeout.connect, read=llm_timeout.read,
+        write=llm_timeout.write, pool=llm_timeout.pool,
+    )
+except Exception:  # very old SDK without the export: fall back to a plain float
+    anthropic_timeout = llm_timeout.read
+
 # Create Anthropic client for TEXT_MODEL if needed
 anthropic_client = None
 if HAS_ANTHROPIC and is_anthropic_provider():
@@ -207,7 +220,7 @@ if HAS_ANTHROPIC and is_anthropic_provider():
         anthropic_client = Anthropic(
             api_key=TEXT_MODEL_API_KEY or "not-needed",
             base_url=_anthropic_base_url(TEXT_MODEL_BASE_URL),
-            timeout=llm_timeout,
+            timeout=anthropic_timeout,
             max_retries=LLM_MAX_RETRIES,
         )
     except Exception as e:
@@ -225,7 +238,7 @@ if HAS_ANTHROPIC and is_anthropic_provider(_chat_base_url):
             anthropic_chat_client = Anthropic(
                 api_key=_chat_cfg['api_key'] or "not-needed",
                 base_url=_anthropic_base_url(_chat_base_url),
-                timeout=llm_timeout,
+                timeout=anthropic_timeout,
                 max_retries=LLM_MAX_RETRIES,
             )
     except Exception as e:
@@ -237,6 +250,28 @@ class _AttrDict:
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
+
+
+def _anthropic_accepts_temperature(model_name):
+    """Whether the Anthropic API still honours a sampling temperature for this model.
+
+    anthropic SDK 1.x removed the typed ``temperature`` kwarg from
+    ``messages.create()`` / ``.stream()`` (passing it is a TypeError), but the
+    API itself still accepts it on Claude 3.x and Claude 4.0-4.6 and rejects it
+    with a 400 on Opus 4.7+ and every Claude 5 model.  We forward it via
+    ``extra_body`` only where it is accepted, so summaries keep the same
+    sampling behaviour as before the SDK upgrade.
+    """
+    m = re.search(r'claude-(?:[a-z]+-)?(\d+)(?:-(\d{1,2})(?!\d))?', model_name or '')
+    if not m:
+        return False
+    major = int(m.group(1))
+    minor = int(m.group(2) or 0)
+    if major <= 3:
+        return True
+    if major == 4:
+        return minor <= 6
+    return False
 
 
 def _make_anthropic_request(anthropic_cl, messages, model_name,
@@ -269,8 +304,10 @@ def _make_anthropic_request(anthropic_cl, messages, model_name,
     }
     if system_text:
         kwargs['system'] = system_text
-    if temperature is not None:
-        kwargs['temperature'] = temperature
+    # SDK 1.x has no temperature kwarg; send it in the raw body only where the
+    # model still accepts it (see _anthropic_accepts_temperature).
+    if temperature is not None and _anthropic_accepts_temperature(model_name):
+        kwargs['extra_body'] = {'temperature': temperature}
 
     if stream:
         return _anthropic_stream_generator(anthropic_cl, kwargs)
