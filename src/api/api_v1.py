@@ -2240,7 +2240,7 @@ def identify_speakers(recording_id):
         if not isinstance(transcription_data, list):
             return jsonify({'error': 'Transcription format not supported for auto-identification'}), 400
 
-        speaker_map = identify_speakers_from_transcript(transcription_data, current_user.id)
+        speaker_map = identify_speakers_from_transcript(transcription_data, current_user.id, recording.participants)
 
         if not speaker_map:
             return jsonify({'error': 'No speakers found in transcription'}), 400

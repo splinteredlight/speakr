@@ -11,13 +11,46 @@ import json
 from flask import current_app
 
 
-def identify_speakers_from_transcript(transcription_data, user_id):
+def _known_full_names(user_id, participants):
+    """Candidate full names: the recording's participants first, then the user's saved speakers."""
+    from src.models import Speaker
+
+    names, seen = [], set()
+    sources = [p.strip() for p in re.split(r'[,;\n]', participants or '')]
+    try:
+        sources += [s.name for s in Speaker.query.filter_by(user_id=user_id).order_by(Speaker.use_count.desc()).all()]
+    except Exception as e:
+        current_app.logger.warning(f"[Auto-Identify] Could not load saved speakers: {e}")
+    for name in sources:
+        name = re.sub(r'\s+', ' ', name or '').strip()
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            names.append(name)
+    return names
+
+
+def _expand_to_full_name(name, participant_names, saved_names):
+    """Expand a bare first name to a full name when exactly one known person matches."""
+    if not name or ' ' in name:
+        return name
+    for pool in (participant_names, saved_names):
+        matches = {n for n in pool if ' ' in n and n.split(' ')[0].lower() == name.lower()}
+        if len(matches) == 1:
+            return matches.pop()
+        if matches:
+            return name  # ambiguous: leave as-is rather than guess
+    return name
+
+
+def identify_speakers_from_transcript(transcription_data, user_id, participants=None):
     """
     Identify speakers in a transcription using an LLM.
 
     Args:
         transcription_data: List of transcript segments (already parsed JSON).
         user_id: Current user's ID (for token tracking).
+        participants: Optional recording participants string; used (with saved
+            speakers) to resolve first names to full names.
 
     Returns:
         dict mapping original speaker labels to identified names.
@@ -69,6 +102,18 @@ def identify_speakers_from_transcript(transcription_data, user_id):
     else:
         transcript_text = formatted_transcription[:transcript_limit]
 
+    participant_names = [p for p in (re.sub(r'\s+', ' ', x).strip() for x in re.split(r'[,;\n]', participants or '')) if p]
+    known_names = _known_full_names(user_id, participants)
+    saved_names = [n for n in known_names if n not in participant_names]
+    known_block = ""
+    if known_names:
+        known_block = (
+            "\n\nKnown people (the listed participants of this meeting come first, then other people this user "
+            "has recorded before). When a speaker is referred to by first name or nickname and it matches one of "
+            "these people, answer with that person's FULL name exactly as written here:\n"
+            + "\n".join(f"- {n}" for n in known_names[:150])
+        )
+
     prompt = f"""Analyze the following conversation transcript and identify the names of the speakers based on the context and content of their dialogue.
 
 The speakers that need to be identified are: {', '.join(speaker_labels)}
@@ -81,7 +126,7 @@ Look for clues in the conversation such as:
 
 Here is the complete conversation transcript:
 
-{transcript_text}
+{transcript_text}{known_block}
 
 Based on the conversation above, identify the most likely real names for the speakers. Pay close attention to how speakers address each other and any names that are mentioned in the dialogue.
 
@@ -164,6 +209,11 @@ JSON Response:
     # --- Sanitize identified_map ---
     identified_map = _sanitize_identified_map(identified_map, speaker_labels)
     current_app.logger.info(f"[Auto-Identify] Sanitized identified_map: {identified_map}")
+
+    # Resolve bare first names to full names from participants / saved speakers
+    for label, name in identified_map.items():
+        identified_map[label] = _expand_to_full_name(name, participant_names, saved_names)
+    current_app.logger.info(f"[Auto-Identify] Full-name-resolved map: {identified_map}")
 
     # Map back to original speaker labels
     final_speaker_map = {}
