@@ -274,6 +274,16 @@ def _anthropic_accepts_temperature(model_name):
     return False
 
 
+def _anthropic_accepts_effort(model_name):
+    """Whether ``output_config.effort`` is accepted: Claude 4.6 and newer."""
+    m = re.search(r'claude-(?:[a-z]+-)?(\d+)(?:-(\d{1,2})(?!\d))?', model_name or '')
+    if not m:
+        return False
+    major = int(m.group(1))
+    minor = int(m.group(2) or 0)
+    return major >= 5 or (major == 4 and minor >= 6)
+
+
 def _make_anthropic_request(anthropic_cl, messages, model_name,
                              temperature=0.7, max_tokens=None, stream=False,
                              response_format=None):
@@ -306,8 +316,16 @@ def _make_anthropic_request(anthropic_cl, messages, model_name,
         kwargs['system'] = system_text
     # SDK 1.x has no temperature kwarg; send it in the raw body only where the
     # model still accepts it (see _anthropic_accepts_temperature).
+    extra_body = {}
     if temperature is not None and _anthropic_accepts_temperature(model_name):
-        kwargs['extra_body'] = {'temperature': temperature}
+        extra_body['temperature'] = temperature
+    # output_config.effort (Claude 4.6+ only; older models reject the field).
+    # ANTHROPIC_EFFORT empty/unset => let the model use its default.
+    effort = (os.environ.get('ANTHROPIC_EFFORT') or '').strip()
+    if effort and _anthropic_accepts_effort(model_name):
+        extra_body['output_config'] = {'effort': effort}
+    if extra_body:
+        kwargs['extra_body'] = extra_body
 
     if stream:
         return _anthropic_stream_generator(anthropic_cl, kwargs)
