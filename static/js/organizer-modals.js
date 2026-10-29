@@ -93,6 +93,7 @@
             default_hotwords: formData.get('default_hotwords') || null,
             default_initial_prompt: formData.get('default_initial_prompt') || null,
             default_transcription_model: formData.get('default_transcription_model') || null,
+            default_participants: formData.get('default_participants') || null,
             retention_days: retentionDays,
             is_auto_process: document.getElementById('tagAutoProcess')?.checked || false,
         };

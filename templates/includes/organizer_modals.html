@@ -33,6 +33,12 @@
                     </div>
                 </div>
 
+                <div>
+                    <label for="tagDefaultParticipants" class="block text-sm font-medium text-[var(--text-secondary)] mb-1">Default Participants</label>
+                    <input type="text" id="tagDefaultParticipants" name="default_participants" maxlength="500" class="w-full px-3 py-2 border border-[var(--border-secondary)] rounded-md focus:outline-none focus:ring-2 focus:ring-[var(--border-focus)] bg-[var(--bg-input)] text-[var(--text-primary)]" placeholder="e.g., Alice Smith, Bob Jones">
+                    <p class="text-xs text-[var(--text-light)] mt-1">Comma-separated names. Applying this tag adds these people to a recording's participants (existing ones are kept).</p>
+                </div>
+
                 {% if enable_auto_processing %}
                 <!-- Auto-process watch folder toggle -->
                 <div id="tagAutoProcessRow" class="flex items-center justify-between py-2 px-3 bg-[var(--bg-tertiary)] rounded-md">

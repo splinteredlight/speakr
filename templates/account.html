@@ -5275,6 +5275,9 @@ curl "https://your-speakr-instance.com/api/recordings?token=YOUR_TOKEN_HERE"</co
                 document.getElementById('tagName').value = tag.name;
                 document.getElementById('tagColor').value = tag.color;
                 document.getElementById('tagCustomPrompt').value = tag.custom_prompt || '';
+                if (document.getElementById('tagDefaultParticipants')) {
+                    document.getElementById('tagDefaultParticipants').value = tag.default_participants || '';
+                }
                 document.getElementById('tagTitlePrompt').value = tag.title_prompt || '';
 
                 // Populate group selection

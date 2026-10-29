@@ -194,6 +194,9 @@ class Tag(db.Model):
     default_initial_prompt = db.Column(db.Text, nullable=True)  # Initial prompt to steer transcription
     default_transcription_model = db.Column(db.String(120), nullable=True)  # Override TRANSCRIPTION_MODEL when set
 
+    # Participants to auto-add to a recording when this tag is applied
+    default_participants = db.Column(db.String(500), nullable=True)  # Comma-separated names, merged into Recording.participants
+
     # Retention and deletion settings
     protect_from_deletion = db.Column(db.Boolean, default=False)  # Exempt tagged recordings from auto-deletion
     retention_days = db.Column(db.Integer, nullable=True)  # Group-specific retention override (overrides global)
@@ -262,6 +265,7 @@ class Tag(db.Model):
             'naming_template_name': self.naming_template.name if self.naming_template else None,
             'export_template_id': self.export_template_id,
             'export_template_name': self.export_template.name if self.export_template else None,
+            'default_participants': self.default_participants,
             'is_auto_process': self.is_auto_process or False,
             'auto_process_folder_name': self.auto_process_folder_name,
             'created_at': self.created_at.isoformat() if self.created_at else None,

@@ -257,6 +257,7 @@ def create_tag():
         default_hotwords=data.get('default_hotwords'),
         default_initial_prompt=data.get('default_initial_prompt'),
         default_transcription_model=data.get('default_transcription_model'),
+        default_participants=data.get('default_participants'),
         protect_from_deletion=protect_from_deletion,
         retention_days=retention_days,
         auto_share_on_apply=data.get('auto_share_on_apply', True) if group_id else True,
@@ -365,6 +366,8 @@ def update_tag(tag_id):
         tag.default_initial_prompt = data['default_initial_prompt'] or None
     if 'default_transcription_model' in data:
         tag.default_transcription_model = data['default_transcription_model'] or None
+    if 'default_participants' in data:
+        tag.default_participants = data['default_participants'] or None
 
     # Handle retention_days: -1 means protected from deletion
     if 'retention_days' in data:
