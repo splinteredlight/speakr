@@ -179,6 +179,9 @@ export function useAudio(state, utils) {
         serverSessionLastError = null;
         if (isServerStreamedRecording) isServerStreamedRecording.value = false;
     }
+    let fileWritableStream = null;   // WritableStream for progressive file save
+    let pendingFileHandle = null;    // FileSystemFileHandle from showSaveFilePicker
+    let pendingSaveFilename = null;  // Filename generated at record start, reused at upload
 
     // Pick the best MediaRecorder container for the capture. Video captures
     // prefer WebM (VP9 then VP8, both with Opus) because Chromium — the only
@@ -455,12 +458,38 @@ export function useAudio(state, utils) {
 
     // Start recording
     // IMPORTANT: For Firefox, getDisplayMedia MUST be the first async call from user gesture
+    // showSaveFilePicker is called first since it's Chrome/Edge only (Firefox doesn't have it)
+    // and getDisplayMedia consumes the user gesture needed by showSaveFilePicker
     const startRecording = async (mode = 'microphone', resumeContext = null) => {
         if (isPreparingRecording.value || isRecording.value) return;
         isPreparingRecording.value = true;
 
         try {
             const needsDisplayMedia = mode === 'system' || mode === 'both';
+
+            // Progressive file save - open save dialog BEFORE getDisplayMedia (Chrome/Edge only)
+            // getDisplayMedia consumes the user gesture, so showSaveFilePicker must come first.
+            // Firefox doesn't have showSaveFilePicker, so this doesn't affect Firefox's
+            // requirement that getDisplayMedia be the first gesture-triggered call.
+            if ('showSaveFilePicker' in window) {
+                try {
+                    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                    pendingSaveFilename = `recording-${timestamp}.webm`;
+                    pendingFileHandle = await window.showSaveFilePicker({
+                        suggestedName: pendingSaveFilename,
+                        types: [{
+                            description: 'WebM Audio',
+                            accept: { 'audio/webm': ['.webm'] }
+                        }]
+                    });
+                } catch (err) {
+                    if (err.name !== 'AbortError') {
+                        console.warn('[FileSave] Failed to open save dialog:', err);
+                    }
+                    pendingFileHandle = null;
+                    pendingSaveFilename = null;
+                }
+            }
 
             // For system audio modes, get display media FIRST before any other operations
             // This is required for Firefox's "transient activation" security model
@@ -480,6 +509,8 @@ export function useAudio(state, utils) {
                         // gets per-OS guidance instead of a bare toast.
                         if (showSystemAudioHelp) showSystemAudioHelp.value = true;
                         showToast('No audio track came through — see the help guide for per-OS setup.', 'fa-exclamation-triangle');
+                        pendingFileHandle = null;
+                        pendingSaveFilename = null;
                         return;
                     }
 
@@ -492,6 +523,9 @@ export function useAudio(state, utils) {
                     } else {
                         showToast(`Failed to capture: ${error.message}`, 'error');
                     }
+                    // Clean up file handle if getDisplayMedia fails
+                    pendingFileHandle = null;
+                    pendingSaveFilename = null;
                     return;
                 }
             }
@@ -532,6 +566,8 @@ export function useAudio(state, utils) {
             pendingDisplayStream.getTracks().forEach(track => track.stop());
             pendingDisplayStream = null;
         }
+        pendingFileHandle = null;
+        pendingSaveFilename = null;
         pendingRecordingMode.value = null;
         pendingResumeContext = null;
     };
@@ -890,9 +926,21 @@ export function useAudio(state, utils) {
                 systemAnalyser.value.fftSize = 256;
 
                 micSource.connect(micAnalyser.value);
-                micSource.connect(destination);
                 systemSource.connect(systemAnalyser.value);
-                systemSource.connect(destination);
+
+                // Dual-channel capture: microphone on the LEFT channel (0),
+                // system/tab audio on the RIGHT channel (1), instead of summing
+                // both into mono. Our WhisperX service diarizes the remote
+                // channel alone and attributes the mic channel to the local
+                // speaker, so the person recording is never clustered with the
+                // remote voices. Each merger input is downmixed to mono by the
+                // Web Audio spec, so a stereo system track still lands on one
+                // channel. Side effect: playback is hard-panned (mic left,
+                // remote right).
+                const channelMerger = audioContext.value.createChannelMerger(2);
+                micSource.connect(channelMerger, 0, 0);
+                systemSource.connect(channelMerger, 0, 1);
+                channelMerger.connect(destination);
 
                 combinedStream = destination.stream;
                 activeStreams.value = [micStream, displayStream];
@@ -1007,9 +1055,32 @@ export function useAudio(state, utils) {
                 }
             }
 
+            // Open writable stream for progressive file saving
+            if (pendingFileHandle) {
+                try {
+                    fileWritableStream = await pendingFileHandle.createWritable();
+                    console.log('[FileSave] Writable stream opened for progressive saving');
+                } catch (err) {
+                    console.warn('[FileSave] Failed to open writable stream:', err);
+                    fileWritableStream = null;
+                }
+                pendingFileHandle = null;
+            }
+
             recorder.ondataavailable = async (event) => {
                 if (event.data.size > 0) {
                     audioChunks.value.push(event.data);
+
+                    // Progressive file save
+                    if (fileWritableStream) {
+                        try {
+                            await fileWritableStream.write(event.data);
+                        } catch (err) {
+                            console.warn('[FileSave] Write failed, disabling progressive save:', err);
+                            try { await fileWritableStream.close(); } catch (_) {}
+                            fileWritableStream = null;
+                        }
+                    }
 
                     // Save chunk to IndexedDB for crash recovery
                     try {
@@ -1048,10 +1119,20 @@ export function useAudio(state, utils) {
                 }
             };
 
-            recorder.onstop = () => {
+            recorder.onstop = async () => {
                 const blob = new Blob(audioChunks.value, { type: mimeType });
                 audioBlobURL.value = URL.createObjectURL(blob);
                 stopSizeMonitoring();
+
+                if (fileWritableStream) {
+                    try {
+                        await fileWritableStream.close();
+                        console.log('[FileSave] File saved successfully');
+                    } catch (err) {
+                        console.warn('[FileSave] Failed to close writable stream:', err);
+                    }
+                    fileWritableStream = null;
+                }
             };
 
             mediaRecorder.value = recorder;
@@ -1344,7 +1425,10 @@ export function useAudio(state, utils) {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const recordedMime = (currentRecordingMimeType || 'audio/webm').split(';')[0];
         const recordedExt = recordedMime === 'video/mp4' ? 'mp4' : 'webm';
-        const _rawRecordedFile = new File(audioChunks.value, `recording-${timestamp}.${recordedExt}`, { type: recordedMime });
+        // Reuse the progressive-save dialog's filename when present, so the
+        // uploaded file matches the copy written to disk during recording.
+        const uploadFilename = pendingSaveFilename || `recording-${timestamp}.${recordedExt}`;
+        const _rawRecordedFile = new File(audioChunks.value, uploadFilename, { type: recordedMime });
         // Prevent Vue from wrapping the binary File in a reactive proxy. See
         // upload.js for rationale (issue #280).
         const recordedFile = (typeof Vue !== 'undefined' && Vue.markRaw)
@@ -1523,7 +1607,10 @@ export function useAudio(state, utils) {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const recordedMime = (currentRecordingMimeType || 'audio/webm').split(';')[0];
         const recordedExt = recordedMime === 'video/mp4' ? 'mp4' : 'webm';
-        const _rawRecordedFile = new File(audioChunks.value, `recording-${timestamp}.${recordedExt}`, { type: recordedMime });
+        // Reuse the progressive-save dialog's filename when present, so the
+        // uploaded file matches the copy written to disk during recording.
+        const uploadFilename = pendingSaveFilename || `recording-${timestamp}.${recordedExt}`;
+        const _rawRecordedFile = new File(audioChunks.value, uploadFilename, { type: recordedMime });
         // Prevent Vue from wrapping the binary File in a reactive proxy. See
         // upload.js for rationale (issue #280).
         const recordedFile = (typeof Vue !== 'undefined' && Vue.markRaw)
@@ -1669,6 +1756,12 @@ export function useAudio(state, utils) {
             URL.revokeObjectURL(audioBlobURL.value);
         }
         audioBlobURL.value = null;
+        if (fileWritableStream) {
+            try { await fileWritableStream.close(); } catch (_) {}
+            fileWritableStream = null;
+        }
+        pendingSaveFilename = null;
+        pendingFileHandle = null;
         audioChunks.value = [];
         isRecording.value = false;
         if (isPaused) isPaused.value = false;
