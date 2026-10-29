@@ -1,15 +1,23 @@
 """
-LLM API integration services (OpenAI/OpenRouter).
+LLM API integration services (OpenAI/OpenRouter/Anthropic).
 """
 
 import json
 import logging
 import os
+import re
 import sys
+import threading
 import time
 
 import httpx
 from openai import APITimeoutError, BadRequestError
+
+try:
+    from anthropic import Anthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
 
 # Use standard logging instead of current_app.logger for context independence
 logger = logging.getLogger(__name__)
@@ -319,6 +327,193 @@ class LLMNotConfiguredError(ValueError):
     """No text model is configured; the API answers with text_model_not_configured."""
 
 
+def is_anthropic_provider(base_url=None):
+    """Check if the provider is Anthropic based on the base URL (default: the text model's)."""
+    url = (base_url if base_url is not None else (_cfg('TEXT_MODEL_BASE_URL') or '')).lower()
+    return 'anthropic.com' in url
+
+
+def _anthropic_base_url(url):
+    """Normalize a base URL for the Anthropic SDK (strip trailing /v1 if present)."""
+    url = (url or '').rstrip('/')
+    if url.endswith('/v1'):
+        url = url[:-3]
+    return url or None
+
+
+# Anthropic SDK clients, one per (key, server, timeouts, retries). Upstream
+# resolves the model configuration at call time since 0.11.4 (models can be
+# assigned in the admin panel without a restart), so the clients are built on
+# first use instead of at import and follow a changed configuration.
+_anthropic_clients = {}
+_anthropic_clients_lock = threading.Lock()
+
+
+def _anthropic_client_for(api_key, base_url):
+    """The Anthropic SDK client for a key and server, built once per configuration."""
+    if not HAS_ANTHROPIC:
+        raise LLMNotConfiguredError(
+            "The model's base URL points at Anthropic but the anthropic SDK client "
+            "is unavailable (is the 'anthropic' package installed?)")
+    runtime = llm_config.runtime_settings()
+    signature = (api_key, _anthropic_base_url(base_url), runtime.connect_timeout,
+                 float(runtime.request_timeout), runtime.write_timeout, runtime.max_retries)
+    with _anthropic_clients_lock:
+        cl = _anthropic_clients.get(signature)
+        if cl is None:
+            # anthropic SDK 1.x is built on httpx2: a Timeout from the old
+            # ``httpx`` package makes every request die with "'Timeout' object
+            # cannot be interpreted as an integer" (surfaced as
+            # APIConnectionError), so build the SDK's own Timeout type.
+            try:
+                from anthropic import Timeout as _AnthropicTimeout
+                timeout = _AnthropicTimeout(
+                    connect=runtime.connect_timeout, read=float(runtime.request_timeout),
+                    write=runtime.write_timeout, pool=30.0)
+            except ImportError:  # very old SDK without the export
+                timeout = float(runtime.request_timeout)
+            if len(_anthropic_clients) >= 8:
+                _anthropic_clients.clear()
+            cl = Anthropic(
+                api_key=api_key or "not-needed",
+                base_url=signature[1],
+                timeout=timeout,
+                max_retries=runtime.max_retries,
+            )
+            _anthropic_clients[signature] = cl
+        return cl
+
+
+class _AttrDict:
+    """Simple object that allows attribute access for OpenAI-compatible response wrapping."""
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+def _anthropic_accepts_temperature(model_name):
+    """Whether the Anthropic API still honours a sampling temperature for this model.
+
+    anthropic SDK 1.x removed the typed ``temperature`` kwarg from
+    ``messages.create()`` / ``.stream()`` (passing it is a TypeError), but the
+    API itself still accepts it on Claude 3.x and Claude 4.0-4.6 and rejects it
+    with a 400 on Opus 4.7+ and every Claude 5 model.  We forward it via
+    ``extra_body`` only where it is accepted, so summaries keep the same
+    sampling behaviour as before the SDK upgrade.
+    """
+    m = re.search(r'claude-(?:[a-z]+-)?(\d+)(?:-(\d{1,2})(?!\d))?', model_name or '')
+    if not m:
+        return False
+    major = int(m.group(1))
+    minor = int(m.group(2) or 0)
+    if major <= 3:
+        return True
+    if major == 4:
+        return minor <= 6
+    return False
+
+
+def _anthropic_accepts_effort(model_name):
+    """Whether ``output_config.effort`` is accepted: Claude 4.6 and newer."""
+    m = re.search(r'claude-(?:[a-z]+-)?(\d+)(?:-(\d{1,2})(?!\d))?', model_name or '')
+    if not m:
+        return False
+    major = int(m.group(1))
+    minor = int(m.group(2) or 0)
+    return major >= 5 or (major == 4 and minor >= 6)
+
+
+def _make_anthropic_request(anthropic_cl, messages, model_name,
+                             temperature=0.7, max_tokens=None, stream=False,
+                             response_format=None, extra_body_config=None):
+    """
+    Make a request using the Anthropic SDK.
+    Returns OpenAI-compatible response objects so callers don't need changes.
+    """
+    # Extract system messages (Anthropic takes system as a separate parameter)
+    system_parts = []
+    user_messages = []
+    for msg in messages:
+        if msg['role'] == 'system':
+            system_parts.append(msg['content'])
+        else:
+            user_messages.append({'role': msg['role'], 'content': msg['content']})
+
+    system_text = '\n\n'.join(system_parts) if system_parts else None
+
+    # Anthropic has no response_format param — add JSON instruction to system prompt
+    if response_format and response_format.get('type') == 'json_object':
+        json_instruction = '\n\nIMPORTANT: You must respond ONLY with valid JSON. No other text.'
+        system_text = (system_text + json_instruction) if system_text else json_instruction
+
+    kwargs = {
+        'model': model_name,
+        'messages': user_messages,
+        'max_tokens': max_tokens or 4096,
+    }
+    if system_text:
+        kwargs['system'] = system_text
+    # SDK 1.x has no temperature kwarg; send it in the raw body only where the
+    # model still accepts it (see _anthropic_accepts_temperature).
+    extra_body = {}
+    if temperature is not None and _anthropic_accepts_temperature(model_name):
+        extra_body['temperature'] = temperature
+    # output_config.effort (Claude 4.6+ only; older models reject the field).
+    # ANTHROPIC_EFFORT empty/unset => let the model use its default.
+    effort = (os.environ.get('ANTHROPIC_EFFORT') or '').strip()
+    if effort and _anthropic_accepts_effort(model_name):
+        extra_body['output_config'] = {'effort': effort}
+    # The role's configured request parameters (TEXT_MODEL_EXTRA_BODY or the
+    # Extra Body of an admin-panel model) are applied last, as upstream does.
+    if extra_body_config:
+        extra_body.update(extra_body_config)
+    if extra_body:
+        kwargs['extra_body'] = extra_body
+
+    if stream:
+        return _anthropic_stream_generator(anthropic_cl, kwargs)
+
+    # Non-streaming request (retries and timeout handled by the SDK client)
+    response = anthropic_cl.messages.create(**kwargs)
+
+    # Map response to OpenAI-compatible shape
+    text = ''.join(block.text for block in response.content if block.type == 'text')
+
+    finish_map = {'end_turn': 'stop', 'max_tokens': 'length', 'stop_sequence': 'stop'}
+    finish_reason = finish_map.get(response.stop_reason, response.stop_reason)
+
+    usage = _AttrDict(
+        prompt_tokens=response.usage.input_tokens,
+        completion_tokens=response.usage.output_tokens,
+        total_tokens=response.usage.input_tokens + response.usage.output_tokens,
+        cost=None
+    )
+    message = _AttrDict(content=text, refusal=None, tool_calls=None)
+    choice = _AttrDict(message=message, finish_reason=finish_reason, index=0)
+
+    return _AttrDict(choices=[choice], usage=usage, id=response.id, model=response.model)
+
+
+def _anthropic_stream_generator(anthropic_cl, kwargs):
+    """Stream from Anthropic SDK, yielding OpenAI-compatible chunk objects."""
+    with anthropic_cl.messages.stream(**kwargs) as stream:
+        for text in stream.text_stream:
+            chunk_delta = _AttrDict(content=text)
+            chunk_choice = _AttrDict(delta=chunk_delta, index=0)
+            yield _AttrDict(choices=[chunk_choice], usage=None)
+
+        # Get final message for usage stats
+        final = stream.get_final_message()
+        if final.usage:
+            final_usage = _AttrDict(
+                prompt_tokens=final.usage.input_tokens,
+                completion_tokens=final.usage.output_tokens,
+                total_tokens=final.usage.input_tokens + final.usage.output_tokens,
+                cost=None
+            )
+            yield _AttrDict(choices=[], usage=final_usage)
+
+
 def call_llm_completion(messages, temperature=0.7, response_format=None, stream=False, max_tokens=None,
                         user_id=None, operation_type=None):
     """
@@ -413,7 +608,15 @@ def call_llm_completion(messages, temperature=0.7, response_format=None, stream=
         )
 
         request_started_at = time.monotonic()
-        response = effective_client.chat.completions.create(**completion_args)
+        if is_anthropic_provider(base_url):
+            response = _make_anthropic_request(
+                _anthropic_client_for(_cfg('TEXT_MODEL_API_KEY'), base_url), messages, model_name,
+                temperature=completion_args.get('temperature'),
+                max_tokens=max_tokens, stream=stream, response_format=response_format,
+                extra_body_config=completion_args.get('extra_body'),
+            )
+        else:
+            response = effective_client.chat.completions.create(**completion_args)
 
         # Track usage for non-streaming calls
         if user_id and operation_type and not stream and response.usage:
@@ -566,7 +769,15 @@ def call_chat_completion(messages, temperature=0.7, response_format=None, stream
         )
 
         request_started_at = time.monotonic()
-        response = effective_client.chat.completions.create(**completion_args)
+        if is_anthropic_provider(base_url):
+            response = _make_anthropic_request(
+                _anthropic_client_for(chat_config['api_key'], base_url), messages, model_name,
+                temperature=completion_args.get('temperature'),
+                max_tokens=max_tokens, stream=stream, response_format=response_format,
+                extra_body_config=completion_args.get('extra_body'),
+            )
+        else:
+            response = effective_client.chat.completions.create(**completion_args)
 
         # Track usage for non-streaming calls
         if user_id and operation_type and not stream and response.usage:
@@ -698,7 +909,15 @@ def call_translation_completion(messages, temperature=0.7, response_format=None,
         )
 
         request_started_at = time.monotonic()
-        response = effective_client.chat.completions.create(**completion_args)
+        if is_anthropic_provider(base_url):
+            response = _make_anthropic_request(
+                _anthropic_client_for(translation_config['api_key'], base_url), messages, model_name,
+                temperature=completion_args.get('temperature'),
+                max_tokens=max_tokens, stream=stream, response_format=response_format,
+                extra_body_config=completion_args.get('extra_body'),
+            )
+        else:
+            response = effective_client.chat.completions.create(**completion_args)
 
         # Track usage for non-streaming calls
         if user_id and operation_type and not stream and response.usage:
