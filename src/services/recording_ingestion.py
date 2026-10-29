@@ -655,6 +655,53 @@ class TagFolderSelection(NamedTuple):
     selected_folder: Optional[Folder]
 
 
+def _round_to_quarter_hour(dt):
+    """Round a datetime to the nearest 15-minute boundary (ties round up).
+
+    Safe to apply to naive-UTC values: real-world timezone offsets are all
+    multiples of 15 minutes, so a quarter-hour boundary in UTC is also one
+    in the viewer's local time.
+    """
+    remainder = timedelta(
+        minutes=dt.minute % 15,
+        seconds=dt.second,
+        microseconds=dt.microsecond,
+    )
+    rounded = dt - remainder
+    if remainder >= timedelta(minutes=7, seconds=30):
+        rounded += timedelta(minutes=15)
+    return rounded
+
+
+def _merge_tag_default_participants(recording, tag):
+    """Merge a tag's default participants into a recording's participants list.
+
+    Append + dedupe (case-insensitive), order-preserving; never removes existing
+    names. Respects the Recording.participants String(500) column cap. Mutates
+    recording.participants in place; the caller is responsible for committing.
+    No-op when the tag has no default_participants. Calling this once per tag
+    accumulates and dedupes across multiple tags, because each call reads the
+    recording's current participants.
+    """
+    if not tag.default_participants:
+        return
+    existing = [p.strip() for p in (recording.participants or '').split(',') if p.strip()]
+    seen = {p.lower() for p in existing}
+    for name in (n.strip() for n in tag.default_participants.split(',')):
+        if not name or name.lower() in seen:
+            continue
+        # Respect the Recording.participants String(500) column cap
+        if len(', '.join(existing + [name])) > 500:
+            current_app.logger.warning(
+                f"Recording {recording.id}: skipping default participant '{name}' from "
+                f"tag '{tag.name}' (would exceed the 500-char participants limit)"
+            )
+            break
+        existing.append(name)
+        seen.add(name.lower())
+    recording.participants = ', '.join(existing)
+
+
 def select_tags_and_folder(*, form, owner):
     """Read the upload's tags and folder from the form, keeping those owner may use.
 
@@ -809,6 +856,8 @@ def store_recording(*, owner, storage, filepath, now, recorded_in_app, original_
                 added_at=datetime.utcnow()
             )
             db.session.add(new_association)
+            # Auto-add each tag's default participants (accumulates + dedupes across tags)
+            _merge_tag_default_participants(recording, tag)
 
         if selected_folder:
             from src.api.folders import apply_group_folder_shares
@@ -1290,6 +1339,14 @@ def ingest(
 
         # Determine meeting_date: prefer user-provided, then client lastModified, then file metadata, then current time
         meeting_date = None
+        # Auto-derived dates get normalised into a "meeting start" estimate
+        # below; a user-provided date is stored exactly as given.
+        meeting_date_is_auto = False
+        # File mtime and upload time mark when the recording ENDED, so the
+        # start estimate subtracts the media duration from them; metadata
+        # creation_time tags are stamped by recorders at recording START, so
+        # those are not shifted.
+        meeting_date_marks_end = False
 
         # First try user-provided meeting_date (ISO 8601 format)
         if user_meeting_date:
@@ -1332,6 +1389,8 @@ def ingest(
                 # regardless of the server's timezone
                 timestamp_ms = int(file_last_modified)
                 meeting_date = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).replace(tzinfo=None)
+                meeting_date_is_auto = True
+                meeting_date_marks_end = True
                 current_app.logger.info(f"Using client file lastModified: {meeting_date}")
             except (ValueError, TypeError, OSError) as e:
                 current_app.logger.warning(f"Could not parse file_last_modified '{file_last_modified}': {e}")
@@ -1340,12 +1399,38 @@ def ingest(
         if not meeting_date:
             meeting_date = to_utc_naive(get_creation_date(filepath, use_file_mtime=False))
             if meeting_date:
+                meeting_date_is_auto = True
                 current_app.logger.info(f"Using file metadata creation date: {meeting_date}")
 
         # Final fallback to current time
         if not meeting_date:
             meeting_date = now
+            meeting_date_is_auto = True
+            meeting_date_marks_end = True
             current_app.logger.debug("No file date available, using current time")
+
+        # Turn auto-derived dates into a meeting-start estimate: shift
+        # end-of-recording timestamps back by the media duration, then round
+        # to the nearest quarter hour (meetings start on :00/:15/:30/:45).
+        if meeting_date_is_auto:
+            recording_end = None
+            if meeting_date_marks_end:
+                recording_end = meeting_date
+                if audio_duration_seconds:
+                    meeting_date -= timedelta(seconds=audio_duration_seconds)
+            rounded = _round_to_quarter_hour(meeting_date)
+            # Rounding UP must not invent a start after the recording's known
+            # end (a future meeting_date lands in the UI's "Upcoming" bucket
+            # and inverts meeting_date/created_at ordering), nor cross UTC
+            # midnight (day-grouping and the summary prompt's relative-date
+            # context read the calendar day) — round down in those cases.
+            if rounded > meeting_date and (
+                (recording_end is not None and rounded > recording_end)
+                or rounded.date() != meeting_date.date()
+            ):
+                rounded -= timedelta(minutes=15)
+            meeting_date = rounded
+            current_app.logger.info(f"Estimated meeting start from auto-derived date: {meeting_date}")
 
         if join:
             return _ingest_join_part(

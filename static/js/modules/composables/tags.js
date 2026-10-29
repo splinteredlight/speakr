@@ -80,6 +80,8 @@ export function useTags({
                 throw new Error(errorData.error || t('errors.addTagFailed'));
             }
 
+            const result = await response.json();
+
             // Update local recording data
             const tagToAdd = availableTags.value.find(tag => tag.id == tagId);
             if (tagToAdd) {
@@ -115,6 +117,18 @@ export function useTags({
                         }
                         selectedRecording.value.tags.push(tagToAdd);
                     }
+                }
+            }
+
+            // Sync participants in case this tag auto-added its default participants
+            // (the backend merges them and returns the updated recording).
+            const updatedParticipants = result?.recording?.participants;
+            if (updatedParticipants !== undefined) {
+                editingRecording.value.participants = updatedParticipants;
+                const recInList = recordings.value.find(r => r.id === editingRecording.value.id);
+                if (recInList) recInList.participants = updatedParticipants;
+                if (selectedRecording.value && selectedRecording.value.id === editingRecording.value.id) {
+                    selectedRecording.value.participants = updatedParticipants;
                 }
             }
 

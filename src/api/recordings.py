@@ -56,7 +56,7 @@ from src.file_exporter import export_recording
 from src.utils.mime import served_media_mime, sandbox_media_response
 from src.utils.search import LIKE_ESCAPE, contains_pattern, text_contains, transcript_contains
 from src.services.storage import get_storage_service
-from src.services.recording_ingestion import ingest
+from src.services.recording_ingestion import ingest, _merge_tag_default_participants
 from src.services.recording_filters import (
     needs_transcription_condition,
     needs_summary_condition,
@@ -797,7 +797,7 @@ def auto_identify_speakers(recording_id):
         if not isinstance(transcription_data, list):
             return jsonify(api_error('transcription_format_unsupported_for_identification')), 400
 
-        speaker_map = identify_speakers_from_transcript(transcription_data, current_user.id)
+        speaker_map = identify_speakers_from_transcript(transcription_data, current_user.id, participants=recording.participants)
 
         if not speaker_map:
             return jsonify(api_error('no_speakers_in_transcription')), 400
@@ -3628,6 +3628,9 @@ def add_tag_to_recording(recording_id):
             order=max_order + 1
         )
         db.session.add(recording_tag)
+
+        # Auto-add this tag's default participants to the recording.
+        _merge_tag_default_participants(recording, tag)
 
         # A group tag with sharing shares the completed recording (same rule
         # as API v1 and the end of processing: src/services/tag_sharing.py).
