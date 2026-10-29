@@ -3625,7 +3625,7 @@ def identify_speakers(recording_id):
         if not isinstance(transcription_data, list):
             return jsonify(api_error('transcription_format_unsupported_for_identification')), 400
 
-        speaker_map = identify_speakers_from_transcript(transcription_data, current_user.id)
+        speaker_map = identify_speakers_from_transcript(transcription_data, current_user.id, participants=recording.participants)
 
         if not speaker_map:
             return jsonify(api_error('no_speakers_in_transcription')), 400
@@ -4439,8 +4439,11 @@ def upload_recording():
       - file (required)
       - notes (optional)
       - title (optional)
-      - meeting_date (optional, ISO 8601)
-      - file_last_modified (optional, ms epoch)
+      - meeting_date (optional, ISO 8601; stored exactly as given)
+      - file_last_modified (optional, ms epoch; treated as the END of the
+        recording — meeting_date is estimated as this minus the media
+        duration, rounded to the nearest 15 minutes. Send meeting_date
+        instead to store an exact start time.)
       - language (optional)
       - min_speakers (optional)
       - max_speakers (optional)
