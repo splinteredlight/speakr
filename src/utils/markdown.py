@@ -91,6 +91,59 @@ def sanitize_html(text):
     return sanitized_html
 
 
+_LIST_ITEM_RE = re.compile(r'^( *)([-*+]|\d+[.)])\s')
+_FENCE_RE = re.compile(r'^\s*(```|~~~)')
+
+
+def _normalize_list_indent(text):
+    """
+    Rescale nested-list indentation to 4 spaces per level.
+
+    Python-Markdown only nests a list item indented by 4 spaces, but LLM
+    summaries (and CommonMark) commonly nest with 2, so every sub-bullet
+    rendered flat at the top level. When the smallest nested list-item indent
+    in the document is 2 or 3 spaces, indented lines inside a list are scaled
+    to 4 spaces per level. Documents already using 4-space nesting are returned
+    unchanged; fenced code blocks are left alone.
+    """
+    lines = text.split('\n')
+
+    unit = None
+    in_fence = False
+    for line in lines:
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        m = None if in_fence else _LIST_ITEM_RE.match(line)
+        if m and m.group(1):
+            n = len(m.group(1))
+            unit = n if unit is None else min(unit, n)
+    if unit is None or unit >= 4:
+        return text
+
+    out = []
+    in_fence = False
+    in_list = False
+    for line in lines:
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+        stripped = line.lstrip(' ')
+        indent = len(line) - len(stripped)
+        if _LIST_ITEM_RE.match(line):
+            in_list = True
+        elif stripped and indent == 0:
+            in_list = False  # paragraph/heading ends the list
+        if in_list and indent and stripped:
+            line = ' ' * ((indent // unit) * 4 + indent % unit) + stripped
+        out.append(line)
+    return '\n'.join(out)
+
+
 def md_to_html(text):
     """
     Convert markdown text to sanitized HTML.
@@ -136,7 +189,7 @@ def md_to_html(text):
         return '\n'.join(result)
 
     # Fix list spacing
-    processed_text = fix_list_spacing(text)
+    processed_text = fix_list_spacing(_normalize_list_indent(text))
 
     # Reset the thread's instance to clear any state from its previous conversion
     md = _markdown()
